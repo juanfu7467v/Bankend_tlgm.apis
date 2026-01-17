@@ -277,10 +277,11 @@ def clean_and_extract(raw_text: str):
 
     return {"text": text, "fields": fields}
 
-# --- Función Principal para Conexión On-Demand (MODIFICADA para múltiples archivos) ---
+# --- Función Principal para Conexión On-Demand (MEJORADA para capturar TODOS los mensajes) ---
 async def send_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """
     Función on-demand con soporte para múltiples archivos y Firebase Storage
+    MEJORADA: Captura TODOS los mensajes y archivos del bot
     """
     client = None
     try:
@@ -344,10 +345,12 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         # 9. Variables para capturar respuestas
         all_received_messages = []  # Para múltiples mensajes del MISMO bot
         all_files_data = []  # Para almacenar archivos para Firebase
-        current_bot_response_complete = asyncio.Event()
         stop_collecting = asyncio.Event()
         
-        # 10. Handler temporal para capturar respuestas
+        # Variable para trackear última actividad
+        last_message_time = [time.time()]  # Usamos lista para poder modificar desde el handler
+        
+        # 10. Handler temporal para capturar respuestas (MEJORADO)
         @client.on(events.NewMessage(incoming=True))
         async def temp_handler(event):
             # Si ya tenemos respuesta completa, ignorar nuevos mensajes
@@ -371,6 +374,9 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 
                 if not sender_is_current_bot:
                     return
+                
+                # Actualizar tiempo de última actividad
+                last_message_time[0] = time.time()
                 
                 raw_text = event.raw_text or ""
                 cleaned = clean_and_extract(raw_text)
@@ -454,12 +460,10 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 all_received_messages.append(msg_obj)
                 print(f"📥 Mensaje recibido de bot: {len(msg_obj['message'])} chars, {len(msg_urls)} archivos")
                 
-                # NO detener inmediatamente - esperar posiblemente múltiples mensajes
-                # Solo detener si es error de formato o "no encontrado"
-                if ("Por favor, usa el formato correcto" in msg_obj["message"] or 
-                    msg_obj["fields"].get("not_found", False)):
-                    print("⚠️ Respuesta de error detectada, deteniendo colección")
-                    current_bot_response_complete.set()
+                # Verificar si es error de formato, pero NO detener inmediatamente
+                # El bot podría seguir enviando más mensajes
+                if ("Por favor, usa el formato correcto" in msg_obj["message"]):
+                    print("⚠️ Error de formato detectado, pero continuamos escuchando por si hay más")
                 
             except Exception as e:
                 print(f"Error en handler temporal: {e}")
@@ -471,8 +475,9 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
             
             # Resetear para este intento
             all_received_messages = []
-            current_bot_response_complete.clear()
+            all_files_data = []
             stop_collecting.clear()
+            last_message_time[0] = time.time()
             
             try:
                 # Determinar timeout según bot
@@ -485,29 +490,26 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 # Timer para múltiples mensajes
                 start_time = time.time()
                 
-                # Esperar respuesta con lógica mejorada
+                # --- LÓGICA DE ESPERA MEJORADA (Idle Timeout) ---
                 try:
-                    # Esperar al menos un mensaje
                     while True:
-                        # Esperar máximo el timeout total
-                        elapsed = time.time() - start_time
-                        if elapsed > timeout:
-                            raise asyncio.TimeoutError(f"Timeout de {timeout}s alcanzado")
+                        elapsed_total = time.time() - start_time
+                        silence_duration = time.time() - last_message_time[0]
                         
-                        # Verificar si ya tenemos mensajes
-                        if all_received_messages:
-                            # Si han pasado 3 segundos desde el último mensaje, asumir que terminó
-                            if time.time() - start_time > 3:
-                                print(f"   {len(all_received_messages)} mensajes recibidos, asumiendo respuesta completa")
-                                current_bot_response_complete.set()
+                        # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
+                        if len(all_received_messages) > 0:
+                            if silence_duration > 4.0: 
+                                print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
                                 break
                         
-                        # Esperar un poco y verificar de nuevo
+                        # Si no ha llegado nada y pasamos el timeout total
+                        if elapsed_total > timeout:
+                            if len(all_received_messages) == 0:
+                                raise asyncio.TimeoutError("El bot no respondió a tiempo")
+                            else:
+                                break  # Cerramos con lo que tengamos
+                                
                         await asyncio.sleep(0.5)
-                        
-                        # Verificar si el handler ya marcó como completo (error de formato, etc.)
-                        if current_bot_response_complete.is_set():
-                            break
                 
                 except asyncio.TimeoutError:
                     # TIMEOUT - este bot no respondió
@@ -529,66 +531,75 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 # 12. SI LLEGAMOS AQUÍ, EL BOT RESPONDIÓ
                 print(f"✅ {current_bot_id} respondió con {len(all_received_messages)} mensajes")
                 
+                # Marcar para detener cualquier espera futura
+                stop_collecting.set()
+                
                 # Procesar respuestas recibidas
                 if all_received_messages:
-                    # Marcar para detener cualquier espera futura
-                    stop_collecting.set()
+                    # Verificar si hay error de formato en cualquier mensaje
+                    format_error_detected = False
+                    for msg in all_received_messages:
+                        if "Por favor, usa el formato correcto" in msg.get("message", ""):
+                            format_error_detected = True
+                            break
                     
-                    # Si recibimos error de formato
-                    if "Por favor, usa el formato correcto" in all_received_messages[0]["message"]:
+                    if format_error_detected:
                         return {
                             "status": "error_bot_format", 
-                            "message": "Formato de consulta incorrecto. " + all_received_messages[0]["message"],
+                            "message": "Formato de consulta incorrecto. Verifica los parámetros enviados.",
                             "bot_used": current_bot_id
                         }
                     
-                    # Si es "no encontrado"
-                    if all_received_messages[0]["fields"].get("not_found", False):
+                    # Verificar si es "no encontrado" en cualquier mensaje
+                    not_found_detected = False
+                    for msg in all_received_messages:
+                        if msg.get("fields", {}).get("not_found", False):
+                            not_found_detected = True
+                            break
+                    
+                    if not_found_detected:
                         return {
                             "status": "error_not_found", 
                             "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato.",
                             "bot_used": current_bot_id
                         }
                     
-                    # Consolidar múltiples mensajes del MISMO bot
-                    final_msg = all_received_messages[0].copy()
+                    # --- CONSOLIDAR TODO EL CONTENIDO (MEJORADO) ---
+                    final_text = []
+                    final_urls = []  # Cambiar a lista para no perder nada
+                    all_fields = {}
                     
-                    # Combinar texto de todos los mensajes
-                    if len(all_received_messages) > 1:
-                        final_msg["message"] = "\n---\n".join([msg["message"] for msg in all_received_messages])
+                    for msg in all_received_messages:
+                        # Consolidar texto
+                        if msg.get("message"):
+                            final_text.append(msg["message"])
                         
-                        # Consolidar URLs de todos los mensajes
-                        consolidated_urls = {}
-                        type_map = {"rostro": "ROSTRO", "huella": "HUELLA", "firma": "FIRMA", 
-                                   "adverso": "ADVERSO", "reverso": "REVERSO"}
+                        # Consolidar fields (sin sobrescribir)
+                        if msg.get("fields"):
+                            for key, value in msg["fields"].items():
+                                if key not in all_fields:
+                                    all_fields[key] = value
                         
-                        for msg in all_received_messages:
-                            for url_obj in msg.get("urls", []):
-                                key_type = url_obj["type"].lower()
-                                key = type_map.get(key_type)
-                                
-                                if key:
-                                    if key not in consolidated_urls:
-                                        consolidated_urls[key] = url_obj["url"]
-                                else:
-                                    base_key = url_obj["type"].upper()
-                                    i = 1
-                                    key_name = base_key
-                                    if key_name in consolidated_urls:
-                                        while f"{base_key}_{i}" in consolidated_urls: 
-                                            i += 1
-                                        key_name = f"{base_key}_{i}"
-                                    consolidated_urls[key_name] = url_obj["url"]
-                        
-                        final_msg["urls"] = consolidated_urls
+                        # Extraer TODAS las URLs de este mensaje
+                        if isinstance(msg.get("urls"), list):
+                            for url_obj in msg["urls"]:
+                                # Agregar URL a la lista (no sobrescribir)
+                                final_urls.append({
+                                    "url": url_obj.get("url"),
+                                    "type": url_obj.get("type", "unknown"),
+                                    "text_context": url_obj.get("text_context", "")
+                                })
                     
-                    # Formatear respuesta final
+                    # Crear JSON de respuesta final
                     final_json = {
-                        "message": final_msg["message"],
-                        "fields": final_msg["fields"],
-                        "urls": final_msg.get("urls", {}),
                         "status": "ok",
-                        "consulta_id": consulta_id
+                        "message": "\n\n---\n\n".join(final_text) if final_text else "Consulta procesada",
+                        "fields": all_fields,
+                        "urls": final_urls,  # Ahora es una lista completa de todos los archivos
+                        "consulta_id": consulta_id,
+                        "bot_used": current_bot_id,
+                        "total_messages": len(all_received_messages),
+                        "total_files": len(final_urls)
                     }
                     
                     # Mover DNI/RUC al nivel superior si existen
@@ -608,17 +619,18 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                             firebase_urls = subir_archivos_a_storage(all_files_data, consulta_id, tipo_consulta)
                             if firebase_urls:
                                 # Agregar URLs de Firebase a la respuesta
-                                firebase_url_dict = {}
-                                for i, url_info in enumerate(firebase_urls):
-                                    firebase_url_dict[f"firebase_{i}"] = url_info["url"]
+                                firebase_url_list = []
+                                for url_info in firebase_urls:
+                                    firebase_url_list.append({
+                                        "url": url_info["url"],
+                                        "type": "firebase_storage",
+                                        "filename": url_info["filename"]
+                                    })
                                 
                                 # Combinar URLs locales con Firebase
-                                if final_json.get("urls"):
-                                    final_json["urls"].update(firebase_url_dict)
-                                else:
-                                    final_json["urls"] = firebase_url_dict
-                                
+                                final_json["urls"].extend(firebase_url_list)
                                 final_json["firebase_uploaded"] = True
+                                final_json["firebase_files"] = len(firebase_urls)
                                 print(f"✅ {len(firebase_urls)} archivos subidos a Firebase Storage")
                         except Exception as e:
                             print(f"⚠️ Error subiendo a Firebase (no crítico): {e}")
@@ -629,8 +641,8 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     
                     return final_json
                 else:
-                    # Caso raro: event.set() pero sin mensajes
-                    raise Exception("Respuesta marcada como completa pero sin mensajes recibidos")
+                    # Caso raro: sin mensajes recibidos
+                    raise Exception("No se recibieron mensajes del bot")
                     
             except UserBlockedError:
                 print(f"❌ {current_bot_id} bloqueado por el usuario")
@@ -788,7 +800,8 @@ def root():
         "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless con Firebase).",
         "mode": "serverless",
         "firebase_available": firebase_available,
-        "cost_optimized": True
+        "cost_optimized": True,
+        "version": "3.0 - Captura múltiple mejorada"
     })
 
 @app.route("/status")
@@ -1234,7 +1247,12 @@ def health_check():
         "mode": "serverless",
         "firebase": firebase_available,
         "timestamp": datetime.utcnow().isoformat(),
-        "session_configured": bool(SESSION_STRING and SESSION_STRING.strip())
+        "session_configured": bool(SESSION_STRING and SESSION_STRING.strip()),
+        "features": {
+            "multiple_messages": True,
+            "idle_timeout": True,
+            "firebase_storage": firebase_available
+        }
     })
 
 @app.route("/debug/bots", methods=["GET"])
@@ -1334,4 +1352,11 @@ if __name__ == "__main__":
     print(f"🔥 Firebase Storage: {'CONECTADO' if firebase_available else 'NO DISPONIBLE'}")
     if firebase_available:
         print(f"   Bucket: {FIREBASE_STORAGE_BUCKET}")
+    print("✨ MEJORAS IMPLEMENTADAS:")
+    print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
+    print("   ✓ Lógica de espera con idle timeout (4 segundos de silencio)")
+    print("   ✓ URLs como lista (no se sobrescriben archivos del mismo tipo)")
+    print("   ✓ Handler más permisivo (no se detiene inmediatamente con errores)")
+    print("   ✓ Consolidación completa de texto y archivos")
+    print("   ✓ Todos los comandos preservados")
     app.run(host="0.0.0.0", port=PORT, debug=False)

@@ -4,3 +4,5 @@ telethon>=1.31.1
 aiohttp
 gunicorn
 requests
+firebase-admin
+google-cloud-storage

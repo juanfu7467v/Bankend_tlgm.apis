@@ -15,6 +15,18 @@ from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 from telethon.errors.rpcerrorlist import UserBlockedError
 
+# Importación CORREGIDA de Firebase
+try:
+    from google.cloud import storage
+    from google.oauth2 import service_account  # ¡NUEVO IMPORT!
+    firebase_available = True
+    print("✅ Firebase SDK disponible")
+except ImportError:
+    print("⚠️ Firebase SDK no disponible. Instala: pip install google-cloud-storage")
+    firebase_available = False
+    storage = None
+    service_account = None
+
 # --- Configuración y Variables de Entorno ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -27,16 +39,6 @@ FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "consulta-pe-abf99")
 FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "firebase-adminsdk-fbsvc@consulta-pe-abf99.iam.gserviceaccount.com")
 FIREBASE_PRIVATE_KEY = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "consulta-pe-abf99.appspot.com")
-
-# Importación condicional de Firebase
-try:
-    from google.cloud import storage
-    firebase_available = True
-    print("✅ Firebase SDK disponible")
-except ImportError:
-    print("⚠️ Firebase SDK no disponible. Instala: pip install google-cloud-storage")
-    firebase_available = False
-    storage = None
 
 # --- Configuración Interna ---
 DOWNLOAD_DIR = "downloads"
@@ -77,14 +79,42 @@ def record_bot_failure(bot_id: str):
 
 # --- Funciones de Firebase Storage (MEJORADAS con logs detallados) ---
 def get_storage_client():
-    """Obtiene el cliente de Firebase Storage"""
-    if not firebase_available:
+    """Obtiene el cliente de Firebase Storage - VERSIÓN CORREGIDA"""
+    if not firebase_available or not service_account:
         print("❌ ERROR: Firebase no disponible al intentar obtener cliente")
         return None
+    
     try:
-        client = storage.Client()
-        print("✅ Cliente de Firebase Storage creado exitosamente")
+        # VERIFICAR que tenemos las credenciales necesarias
+        if not FIREBASE_PRIVATE_KEY or not FIREBASE_CLIENT_EMAIL:
+            print("❌ ERROR: Faltan credenciales de Firebase (private_key o client_email)")
+            return None
+        
+        print(f"🔑 Intentando autenticar Firebase con: {FIREBASE_CLIENT_EMAIL}")
+        
+        # Crear diccionario de credenciales desde variables de entorno - ¡CORRECCIÓN AQUÍ!
+        service_account_info = {
+            "type": "service_account",
+            "project_id": FIREBASE_PROJECT_ID,
+            "private_key": FIREBASE_PRIVATE_KEY,
+            "client_email": FIREBASE_CLIENT_EMAIL,
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{FIREBASE_CLIENT_EMAIL.replace('@', '%40')}"
+        }
+        
+        # Crear credenciales explícitas
+        credentials = service_account.Credentials.from_service_account_info(service_account_info)
+        
+        # Crear cliente con credenciales explícitas
+        client = storage.Client(
+            project=FIREBASE_PROJECT_ID,
+            credentials=credentials
+        )
+        
+        print("✅ Cliente de Firebase Storage creado exitosamente con credenciales explícitas")
         return client
+        
     except Exception as e:
         print(f"❌ ERROR CRÍTICO al conectar con Firebase Storage: {str(e)}")
         traceback.print_exc()
@@ -325,7 +355,7 @@ def clean_and_extract(raw_text: str):
         "ubigeo": r"UBIGEO\s*:\s*(.*?)(?:\n|$)",
         "departamento": r"DEPARTAMENTO\s*:\s*(.*?)(?:\n|$)",
         "provincia": r"PROVINCIA\s*:\s*(.*?)(?:\n|$)",
-        "distrito": r"DISTRITO\s*:\s*(.*?)(?:\n|$)",
+        "distrito": r"DISTRITO\s*:\s*(TODO\s+EL\s+DISTRITO|.*?)(?:\n|$)",
     }
     
     for key, pattern in patterns.items():
@@ -357,8 +387,11 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
     Función on-demand con soporte para múltiples archivos y Firebase Storage
     MEJORADA: Captura TODOS los mensajes y archivos del bot
     MEJORADA: Devuelve JSON limpio sin marcas LEDERDATA
+    CORREGIDA: Evita desconexión prematura
     """
     client = None
+    handler_removed = False
+    
     try:
         # 1. Verificar credenciales
         if API_ID == 0 or not API_HASH:
@@ -425,6 +458,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         # 9. Variables para capturar respuestas
         all_received_messages = []  # Para múltiples mensajes del MISMO bot
         all_files_data = []  # Para almacenar archivos para Firebase
+        all_download_tasks = []  # ¡NUEVO: Para trackear descargas activas!
         stop_collecting = asyncio.Event()
         
         # Variable para trackear última actividad
@@ -465,77 +499,19 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 if dni and cleaned["fields"].get("dni") != dni:
                     return  # Ignorar si el DNI no coincide
                 
-                msg_urls = []
-                
-                # Manejar archivos adjuntos
-                if getattr(event, "message", None) and getattr(event.message, "media", None):
-                    media_list = []
-                    
-                    if isinstance(event.message.media, (MessageMediaDocument, MessageMediaPhoto)):
-                        media_list.append(event.message.media)
-                    
-                    if media_list:
-                        timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
-                        
-                        for i, media in enumerate(media_list):
-                            try:
-                                file_ext = '.file'
-                                content_type = None
-                                
-                                if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
-                                    file_name = getattr(media.document, 'file_name', 'file')
-                                    file_ext = os.path.splitext(file_name)[1]
-                                    # Determinar content_type
-                                    if 'pdf' in file_name.lower() or file_ext == '.pdf':
-                                        content_type = 'application/pdf'
-                                    elif 'jpg' in file_name.lower() or 'jpeg' in file_name.lower() or file_ext in ['.jpg', '.jpeg']:
-                                        content_type = 'image/jpeg'
-                                    elif 'png' in file_name.lower() or file_ext == '.png':
-                                        content_type = 'image/png'
-                                    else:
-                                        content_type = 'application/octet-stream'
-                                elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
-                                    file_ext = '.jpg'
-                                    content_type = 'image/jpeg'
-                                    
-                                dni_part = f"_{cleaned['fields'].get('dni')}" if cleaned["fields"].get("dni") else ""
-                                type_part = f"_{cleaned['fields'].get('photo_type')}" if cleaned['fields'].get('photo_type') else ""
-                                unique_filename = f"{timestamp_str}_{event.message.id}{dni_part}{type_part}_{i}{file_ext}"
-                                
-                                # Descargar archivo
-                                saved_path = await client.download_media(event.message, file=os.path.join(DOWNLOAD_DIR, unique_filename))
-                                
-                                # Leer contenido para Firebase
-                                if os.path.exists(saved_path):
-                                    with open(saved_path, 'rb') as f:
-                                        file_content = f.read()
-                                    
-                                    # Guardar para subir a Firebase
-                                    all_files_data.append((unique_filename, file_content, content_type))
-                                
-                                # URL local temporal
-                                url_obj = {
-                                    "url": f"{PUBLIC_URL}/files/{os.path.basename(saved_path)}", 
-                                    "type": "document",  # Siempre "document" para consistencia
-                                }
-                                msg_urls.append(url_obj)
-                                
-                            except Exception as e:
-                                print(f"Error procesando archivo {i}: {e}")
-                                continue
-                
                 msg_obj = {
                     "chat_id": getattr(event, "chat_id", None),
                     "from_id": event.sender_id,
                     "date": event.message.date.isoformat() if getattr(event, "message", None) else datetime.utcnow().isoformat(),
                     "message": cleaned["text"],
                     "fields": cleaned["fields"],
-                    "urls": msg_urls,
-                    "bot_id": current_bot_entity.id if current_bot_entity else None
+                    "urls": [],
+                    "bot_id": current_bot_entity.id if current_bot_entity else None,
+                    "event_message": event.message  # ¡NUEVO: Guardar el objeto completo para descargas posteriores
                 }
                 
                 all_received_messages.append(msg_obj)
-                print(f"📥 Mensaje recibido de bot: {len(msg_obj['message'])} chars, {len(msg_urls)} archivos")
+                print(f"📥 Mensaje recibido de bot: {len(msg_obj['message'])} chars")
                 
                 # Verificar si es error de formato, pero NO detener inmediatamente
                 # El bot podría seguir enviando más mensajes
@@ -553,6 +529,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
             # Resetear para este intento
             all_received_messages = []
             all_files_data = []
+            all_download_tasks = []  # ¡NUEVO: Resetear tareas de descarga
             stop_collecting.clear()
             last_message_time[0] = time.time()
             
@@ -621,6 +598,10 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                             break
                     
                     if format_error_detected:
+                        # Remover handler ANTES de desconectar
+                        if client and not handler_removed:
+                            client.remove_event_handler(temp_handler)
+                            handler_removed = True
                         return {
                             "status": "error",
                             "message": "Formato de consulta incorrecto. Verifica los parámetros enviados."
@@ -634,10 +615,98 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                             break
                     
                     if not_found_detected:
+                        # Remover handler ANTES de desconectar
+                        if client and not handler_removed:
+                            client.remove_event_handler(temp_handler)
+                            handler_removed = True
                         return {
                             "status": "error",
                             "message": "No se encontraron resultados para dicha consulta. Intenta con otro dato."
                         }
+                    
+                    # --- DESCARGAR ARCHIVOS ANTES DE CERRAR CONEXIÓN ---
+                    print(f"📥 Iniciando descarga de archivos multimedia...")
+                    
+                    for idx, msg in enumerate(all_received_messages):
+                        try:
+                            event_msg = msg.get("event_message")
+                            if event_msg and getattr(event_msg, "media", None):
+                                media_list = []
+                                
+                                if isinstance(event_msg.media, (MessageMediaDocument, MessageMediaPhoto)):
+                                    media_list.append(event_msg.media)
+                                
+                                for i, media in enumerate(media_list):
+                                    try:
+                                        file_ext = '.file'
+                                        content_type = None
+                                        
+                                        if hasattr(media, 'document') and hasattr(media.document, 'attributes'):
+                                            file_name = getattr(media.document, 'file_name', 'file')
+                                            file_ext = os.path.splitext(file_name)[1]
+                                            # Determinar content_type
+                                            if 'pdf' in file_name.lower() or file_ext == '.pdf':
+                                                content_type = 'application/pdf'
+                                            elif 'jpg' in file_name.lower() or 'jpeg' in file_name.lower() or file_ext in ['.jpg', '.jpeg']:
+                                                content_type = 'image/jpeg'
+                                            elif 'png' in file_name.lower() or file_ext == '.png':
+                                                content_type = 'image/png'
+                                            else:
+                                                content_type = 'application/octet-stream'
+                                        elif isinstance(media, MessageMediaPhoto) or (hasattr(media, 'photo') and media.photo):
+                                            file_ext = '.jpg'
+                                            content_type = 'image/jpeg'
+                                            
+                                        dni_part = f"_{msg['fields'].get('dni')}" if msg['fields'].get('dni') else ""
+                                        type_part = f"_{msg['fields'].get('photo_type')}" if msg['fields'].get('photo_type') else ""
+                                        timestamp_str = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+                                        unique_filename = f"{timestamp_str}_{event_msg.id}{dni_part}{type_part}_{i}{file_ext}"
+                                        
+                                        # DESCARGAR ARCHIVO SÍNCRONO - ¡IMPORTANTE!
+                                        print(f"   Descargando archivo {i+1} del mensaje {idx+1}...")
+                                        
+                                        # Verificar que el cliente siga conectado
+                                        if not client.is_connected():
+                                            print("⚠️ Cliente desconectado durante descarga, reconectando...")
+                                            await client.connect()
+                                        
+                                        saved_path = await client.download_media(
+                                            event_msg, 
+                                            file=os.path.join(DOWNLOAD_DIR, unique_filename)
+                                        )
+                                        
+                                        # Leer contenido para Firebase
+                                        if saved_path and os.path.exists(saved_path):
+                                            with open(saved_path, 'rb') as f:
+                                                file_content = f.read()
+                                            
+                                            # Guardar para subir a Firebase
+                                            all_files_data.append((unique_filename, file_content, content_type))
+                                            
+                                            # URL local temporal
+                                            msg_url = {
+                                                "url": f"{PUBLIC_URL}/files/{os.path.basename(saved_path)}", 
+                                                "type": "document",
+                                            }
+                                            if "urls" not in msg:
+                                                msg["urls"] = []
+                                            msg["urls"].append(msg_url)
+                                        
+                                        print(f"   ✅ Archivo descargado: {unique_filename}")
+                                        
+                                    except Exception as e:
+                                        print(f"❌ Error procesando archivo {i} del mensaje {idx}: {e}")
+                                        continue
+                        except Exception as e:
+                            print(f"❌ Error procesando mensaje {idx} para archivos: {e}")
+                            continue
+                    
+                    print(f"📊 Total de archivos descargados: {len(all_files_data)}")
+                    
+                    # Remover handler ANTES de cualquier posible desconexión
+                    if client and not handler_removed:
+                        client.remove_event_handler(temp_handler)
+                        handler_removed = True
                     
                     # --- CONSOLIDAR CAMPOS DE TODOS LOS MENSAJES (MEJORADO) ---
                     final_fields = {}
@@ -696,17 +765,23 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     else:
                         response_data["storage"] = "local"
                     
-                    # LIMPIAR handler de eventos para evitar fugas
-                    client.remove_event_handler(temp_handler)
-                    
                     return response_data
                 else:
                     # Caso raro: sin mensajes recibidos
+                    # Remover handler antes de desconectar
+                    if client and not handler_removed:
+                        client.remove_event_handler(temp_handler)
+                        handler_removed = True
                     raise Exception("No se recibieron mensajes del bot")
                     
             except UserBlockedError:
                 print(f"❌ {current_bot_id} bloqueado por el usuario")
                 record_bot_failure(current_bot_id)
+                
+                # Remover handler antes de continuar
+                if client and not handler_removed:
+                    client.remove_event_handler(temp_handler)
+                    handler_removed = True
                 
                 if attempt < len(bots_order):
                     continue
@@ -719,6 +794,11 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 # Si es error grave y es el bot principal, bloquearlo
                 if "blocked" in str(e).lower() and current_bot_id == LEDERDATA_BOT_ID:
                     record_bot_failure(LEDERDATA_BOT_ID)
+                
+                # Remover handler antes de continuar
+                if client and not handler_removed:
+                    client.remove_event_handler(temp_handler)
+                    handler_removed = True
                 
                 if attempt < len(bots_order):
                     print(f"🔄 Intentando con siguiente bot...")
@@ -736,13 +816,20 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         }
         
     finally:
-        # 15. Limpieza final
+        # 15. Limpieza final - ¡AHORA SÍ podemos desconectar!
         if client:
             try:
+                # Asegurarnos de que el handler ya fue removido
+                if not handler_removed:
+                    try:
+                        client.remove_event_handler(temp_handler)
+                    except:
+                        pass
+                
                 await client.disconnect()
-                print("🔌 Cliente desconectado")
-            except:
-                pass
+                print("🔌 Cliente desconectado exitosamente")
+            except Exception as e:
+                print(f"⚠️ Error desconectando cliente: {e}")
         
         # Limpiar archivos descargados más antiguos de 5 minutos
         try:
@@ -861,7 +948,7 @@ def root():
         "mode": "serverless",
         "firebase_available": firebase_available,
         "cost_optimized": True,
-        "version": "4.0 - JSON limpio y Firebase mejorado"
+        "version": "4.1 - Firebase FIXED y desconexión mejorada"
     })
 
 @app.route("/status")
@@ -876,12 +963,24 @@ def status():
             "block_hours": BOT_BLOCK_HOURS if is_blocked else 0
         }
     
+    # Verificar Firebase explícitamente
+    firebase_test = False
+    if firebase_available:
+        try:
+            client = get_storage_client()
+            if client:
+                firebase_test = True
+        except:
+            pass
+    
     return jsonify({
         "status": "ready",
         "session_loaded": bool(SESSION_STRING and SESSION_STRING.strip()),
         "api_credentials_ok": API_ID != 0 and bool(API_HASH),
         "firebase_available": firebase_available,
+        "firebase_working": firebase_test,
         "firebase_bucket": FIREBASE_STORAGE_BUCKET if firebase_available else "no configurado",
+        "firebase_client_email": FIREBASE_CLIENT_EMAIL if firebase_available else "no configurado",
         "bot_status": bot_status,
         "mode": "on-demand",
         "timeouts": {
@@ -1302,10 +1401,28 @@ def login_info():
 
 @app.route("/health", methods=["GET"])
 def health_check():
+    # Probar Firebase explícitamente
+    firebase_test = False
+    firebase_error = None
+    if firebase_available:
+        try:
+            client = get_storage_client()
+            if client:
+                # Intentar una operación simple
+                bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
+                firebase_test = bucket.exists()
+        except Exception as e:
+            firebase_error = str(e)
+    
     return jsonify({
         "status": "healthy",
         "mode": "serverless",
-        "firebase": firebase_available,
+        "firebase": {
+            "available": firebase_available,
+            "working": firebase_test,
+            "error": firebase_error,
+            "bucket": FIREBASE_STORAGE_BUCKET if firebase_available else None
+        },
         "timestamp": datetime.utcnow().isoformat(),
         "session_configured": bool(SESSION_STRING and SESSION_STRING.strip()),
         "features": {
@@ -1337,7 +1454,8 @@ def debug_bots():
         "firebase": {
             "available": firebase_available,
             "bucket": FIREBASE_STORAGE_BUCKET if firebase_available else None,
-            "project": FIREBASE_PROJECT_ID if firebase_available else None
+            "project": FIREBASE_PROJECT_ID if firebase_available else None,
+            "client_email": FIREBASE_CLIENT_EMAIL if firebase_available else None
         }
     })
 
@@ -1359,9 +1477,6 @@ def test_firebase():
                 "message": "No se pudo crear cliente de Firebase Storage"
             }), 500
         
-        # Intentar listar buckets
-        buckets = list(client.list_buckets())
-        
         # Probar bucket específico
         bucket = client.bucket(FIREBASE_STORAGE_BUCKET)
         bucket_exists = bucket.exists()
@@ -1370,10 +1485,10 @@ def test_firebase():
             "status": "ok",
             "message": "Conexión a Firebase Storage exitosa",
             "project": client.project,
-            "buckets_count": len(buckets),
             "configured_bucket": FIREBASE_STORAGE_BUCKET,
             "bucket_exists": bucket_exists,
-            "client_email": FIREBASE_CLIENT_EMAIL
+            "client_email": FIREBASE_CLIENT_EMAIL,
+            "auth_method": "service_account_credentials"
         })
         
     except Exception as e:
@@ -1381,7 +1496,12 @@ def test_firebase():
         traceback.print_exc()
         return jsonify({
             "status": "error",
-            "message": f"Error conectando a Firebase Storage: {str(e)}"
+            "message": f"Error conectando a Firebase Storage: {str(e)}",
+            "debug_info": {
+                "project_id": FIREBASE_PROJECT_ID,
+                "client_email": FIREBASE_CLIENT_EMAIL,
+                "private_key_configured": bool(FIREBASE_PRIVATE_KEY)
+            }
         }), 500
 
 @app.route("/firebase/files/<consulta_id>", methods=["GET"])
@@ -1423,12 +1543,13 @@ if __name__ == "__main__":
     print(f"🔥 Firebase Storage: {'CONECTADO' if firebase_available else 'NO DISPONIBLE'}")
     if firebase_available:
         print(f"   Bucket: {FIREBASE_STORAGE_BUCKET}")
+        print(f"   Client Email: {FIREBASE_CLIENT_EMAIL}")
+        print(f"   Auth Method: Service Account Credentials")
     print("✨ MEJORAS IMPLEMENTADAS:")
+    print("   ✓ FIX: Credenciales explícitas de Firebase (NO más DefaultCredentialsError)")
+    print("   ✓ FIX: Descarga de archivos ANTES de desconectar cliente")
+    print("   ✓ FIX: Handler removido correctamente para evitar fugas")
     print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
     print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
     print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
-    print("   ✓ Persistencia obligatoria en Firebase Storage")
-    print("   ✓ Logs detallados de errores de Firebase")
-    print("   ✓ URLs limpias sin text_context")
-    print("   ✓ Todos los comandos preservados")
     app.run(host="0.0.0.0", port=PORT, debug=False)

@@ -129,10 +129,9 @@ def clean_and_extract(raw_text: str):
 # --- Función Principal para Conexión On-Demand (MEJORADA para manejo de failover) ---
 async def send_telegram_command(command: str, consulta_id: str = None, endpoint_path: str = None):
     """
-    Función on-demand con manejo CORREGIDO de failover:
+    Función on-demand con manejo CORREGIDO de duplicación:
     - Envía comando UNA SOLA VEZ al bot principal
-    - Solo si recibe "ANTI-SPAM", envía UNA SOLA VEZ al bot de respaldo
-    - Si el bot principal no responde nada (caído/lageado), usa solo el bot de respaldo
+    - Solo si recibe "ANTI-SPAM" o timeout, intenta UNA SOLA VEZ con el bot de respaldo
     """
     client = None
     handler_removed = False
@@ -194,8 +193,8 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         # Variable para trackear última actividad
         last_message_time = [time.time()]
         
-        # Bandera para saber si estamos usando el bot de respaldo
-        using_backup = False
+        # Bandera para saber de qué bot estamos recibiendo mensajes
+        current_bot_id = None
         
         # 8. Handler temporal para capturar respuestas
         @client.on(events.NewMessage(incoming=True))
@@ -205,8 +204,9 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 
             try:
                 # Verificar si el mensaje viene del bot que estamos usando actualmente
-                current_bot_id = LEDERDATA_BACKUP_BOT_ID if using_backup else LEDERDATA_BOT_ID
-                
+                if not current_bot_id:
+                    return  # Aún no hemos definido qué bot estamos usando
+                    
                 try:
                     entity = await client.get_entity(current_bot_id)
                     if event.sender_id != entity.id:
@@ -236,37 +236,33 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 }
                 
                 all_received_messages.append(msg_obj)
-                print(f"📥 Mensaje recibido de bot {'(respaldo)' if using_backup else '(principal)'}: {len(msg_obj['message'])} chars")
-                
-                # Detectar si es mensaje ANTI-SPAM
-                if "⛔ ANTI-SPAM" in raw_text or "ANTI-SPAM" in raw_text:
-                    print("⚠️ Detectado mensaje ANTI-SPAM del bot principal")
-                    # Esto se manejará en la lógica principal
+                print(f"📥 Mensaje recibido de bot {'(respaldo)' if current_bot_id == LEDERDATA_BACKUP_BOT_ID else '(principal)'}: {len(msg_obj['message'])} chars")
                 
             except Exception as e:
                 print(f"Error en handler temporal: {e}")
         
-        # 9. INTENTO CON BOT PRINCIPAL
-        print(f"\n🎯 INTENTANDO CON BOT PRINCIPAL: {bot_to_use_first}")
-        print(f"   Comando: {command}")
-        print(f"   Timeout: {TIMEOUT_PRIMARY}s")
-        
-        # Resetear para este intento
-        all_received_messages = []
-        all_files_data = []
-        stop_collecting.clear()
-        last_message_time[0] = time.time()
-        using_backup = False
-        
-        try:
-            # Enviar comando UNA SOLA VEZ al bot principal
-            await client.send_message(bot_to_use_first, command)
+        # 9. INTENTO CON BOT PRINCIPAL (SI DISPONIBLE)
+        if bot_to_use_first == LEDERDATA_BOT_ID:
+            print(f"\n🎯 INTENTANDO CON BOT PRINCIPAL: {bot_to_use_first}")
+            print(f"   Comando: {command}")
+            print(f"   Timeout: {TIMEOUT_PRIMARY}s")
             
-            # Timer para múltiples mensajes
-            start_time = time.time()
+            # Resetear para este intento
+            all_received_messages = []
+            all_files_data = []
+            stop_collecting.clear()
+            last_message_time[0] = time.time()
+            current_bot_id = LEDERDATA_BOT_ID
             
-            # --- LÓGICA DE ESPERA PARA BOT PRINCIPAL ---
             try:
+                # Enviar comando UNA SOLA VEZ al bot principal
+                await client.send_message(bot_to_use_first, command)
+                print(f"✅ Comando enviado UNA VEZ al bot principal")
+                
+                # Timer para múltiples mensajes
+                start_time = time.time()
+                
+                # --- LÓGICA DE ESPERA PARA BOT PRINCIPAL ---
                 while True:
                     elapsed_total = time.time() - start_time
                     silence_duration = time.time() - last_message_time[0]
@@ -283,24 +279,20 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                             print(f"⏰ TIMEOUT: Bot principal no respondió en {TIMEOUT_PRIMARY}s")
                             # Bot principal está caído/lageado
                             record_bot_failure(LEDERDATA_BOT_ID)
-                            
-                            # Verificar si tenemos bot de respaldo disponible
-                            if not bot_to_use_backup:
-                                raise Exception("Bot principal no respondió y no hay bot de respaldo disponible")
-                            
-                            # Proceder a usar el bot de respaldo (continuar fuera del while)
-                            break
+                            break  # Salir para intentar con bot de respaldo
                         else:
                             break  # Cerramos con lo que tengamos
                             
                     await asyncio.sleep(0.5)
                 
-            except asyncio.TimeoutError:
-                print(f"⏰ TIMEOUT EXCEPCION: Bot principal no respondió")
+            except UserBlockedError:
+                print(f"❌ Bot principal bloqueado por el usuario")
                 record_bot_failure(LEDERDATA_BOT_ID)
-                
-                if not bot_to_use_backup:
-                    raise Exception("Bot principal no respondió y no hay bot de respaldo disponible")
+                all_received_messages = []  # Limpiar mensajes
+            except Exception as e:
+                print(f"❌ Error con bot principal: {str(e)[:100]}")
+                if "blocked" in str(e).lower():
+                    record_bot_failure(LEDERDATA_BOT_ID)
             
             # 10. ANALIZAR RESPUESTA DEL BOT PRINCIPAL
             if all_received_messages:
@@ -321,7 +313,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                     await asyncio.sleep(5)
                     
                     # Continuar con la lógica del bot de respaldo
-                    # (el código continúa después de este bloque)
+                    # (se procesará después de este bloque)
                 else:
                     # Bot principal respondió normalmente, procesar respuesta
                     stop_collecting.set()
@@ -329,14 +321,27 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                         client, temp_handler, all_received_messages, 
                         all_files_data, handler_removed, consulta_id
                     )
-            
-            # 11. SI LLEGAMOS AQUÍ, NECESITAMOS USAR BOT DE RESPALDO
-            # (porque: 1) bot principal no respondió nada, o 2) bot principal respondió ANTI-SPAM)
-            
-            if not bot_to_use_backup:
-                raise Exception("Se requiere bot de respaldo pero no está disponible")
-            
-            print(f"\n🔄 INTENTANDO CON BOT DE RESPALDO: {bot_to_use_backup}")
+        
+        # 11. SI NECESITAMOS USAR BOT DE RESPALDO
+        # (porque: 1) bot principal no respondió, 2) bot principal respondió ANTI-SPAM, 
+        # 3) bot principal está bloqueado, o 4) estamos usando directamente el bot de respaldo como principal)
+        
+        # Verificar si necesitamos usar el bot de respaldo
+        use_backup = False
+        reason = ""
+        
+        if not all_received_messages and bot_to_use_backup:
+            use_backup = True
+            reason = "bot principal no respondió"
+        elif anti_spam_detected and bot_to_use_backup:
+            use_backup = True
+            reason = "ANTI-SPAM detectado"
+        elif bot_to_use_first == LEDERDATA_BACKUP_BOT_ID:
+            use_backup = True
+            reason = "usando bot de respaldo como principal"
+        
+        if use_backup and bot_to_use_backup:
+            print(f"\n🔄 INTENTANDO CON BOT DE RESPALDO: {bot_to_use_backup} (Razón: {reason})")
             print(f"   Comando: {command}")
             print(f"   Timeout: {TIMEOUT_BACKUP}s")
             
@@ -345,41 +350,36 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
             all_files_data = []
             stop_collecting.clear()
             last_message_time[0] = time.time()
-            using_backup = True
+            current_bot_id = LEDERDATA_BACKUP_BOT_ID
             
             # Enviar comando UNA SOLA VEZ al bot de respaldo
             await client.send_message(bot_to_use_backup, command)
+            print(f"✅ Comando enviado UNA VEZ al bot de respaldo")
             
             # Timer para bot de respaldo
             start_time = time.time()
             
             # --- LÓGICA DE ESPERA PARA BOT DE RESPALDO ---
-            try:
-                while True:
-                    elapsed_total = time.time() - start_time
-                    silence_duration = time.time() - last_message_time[0]
-                    
-                    # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
-                    if len(all_received_messages) > 0:
-                        if silence_duration > 4.0: 
-                            print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
-                            break
-                    
-                    # Si no ha llegado nada y pasamos el timeout total
-                    if elapsed_total > TIMEOUT_BACKUP:
-                        if len(all_received_messages) == 0:
-                            print(f"⏰ TIMEOUT: Bot de respaldo no respondió en {TIMEOUT_BACKUP}s")
-                            record_bot_failure(LEDERDATA_BACKUP_BOT_ID)
-                            raise Exception("Bot de respaldo no respondió a tiempo")
-                        else:
-                            break
-                            
-                    await asyncio.sleep(0.5)
+            while True:
+                elapsed_total = time.time() - start_time
+                silence_duration = time.time() - last_message_time[0]
                 
-            except asyncio.TimeoutError:
-                print(f"⏰ TIMEOUT: Bot de respaldo no respondió")
-                record_bot_failure(LEDERDATA_BACKUP_BOT_ID)
-                raise Exception("Ningún bot respondió. Timeout excedido.")
+                # Si ya recibimos algo, esperamos un silencio de 4 segundos para cerrar
+                if len(all_received_messages) > 0:
+                    if silence_duration > 4.0: 
+                        print(f"✅ Silencio detectado ({silence_duration:.1f}s). Total mensajes: {len(all_received_messages)}")
+                        break
+                
+                # Si no ha llegado nada y pasamos el timeout total
+                if elapsed_total > TIMEOUT_BACKUP:
+                    if len(all_received_messages) == 0:
+                        print(f"⏰ TIMEOUT: Bot de respaldo no respondió en {TIMEOUT_BACKUP}s")
+                        record_bot_failure(LEDERDATA_BACKUP_BOT_ID)
+                        raise Exception("Bot de respaldo no respondió a tiempo")
+                    else:
+                        break
+                        
+                await asyncio.sleep(0.5)
             
             # 12. PROCESAR RESPUESTA DEL BOT DE RESPALDO
             if all_received_messages:
@@ -391,40 +391,11 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
                 )
             else:
                 raise Exception("No se recibieron mensajes del bot de respaldo")
-                
-        except UserBlockedError:
-            print(f"❌ Bot principal bloqueado por el usuario")
-            record_bot_failure(LEDERDATA_BOT_ID)
-            
-            # Remover handler
-            if client and not handler_removed:
-                client.remove_event_handler(temp_handler)
-                handler_removed = True
-            
-            # Intentar con bot de respaldo si está disponible
-            if bot_to_use_backup:
-                print("🔄 Bot principal bloqueado, intentando con bot de respaldo...")
-                # Aquí podríamos reiniciar el proceso con el bot de respaldo
-                # Pero por simplicidad, lanzamos excepción y dejamos que el usuario reintente
-                raise Exception("Bot principal bloqueado. Por favor, intente nuevamente.")
-            else:
-                raise Exception("Bot principal bloqueado y no hay bot de respaldo disponible")
-                
-        except Exception as e:
-            print(f"❌ Error con bot principal: {str(e)[:100]}")
-            
-            # Remover handler
-            if client and not handler_removed:
-                client.remove_event_handler(temp_handler)
-                handler_removed = True
-            
-            # Si es error grave, bloquear bot principal
-            if "blocked" in str(e).lower():
-                record_bot_failure(LEDERDATA_BOT_ID)
-            
-            # Re-lanzar excepción
-            raise e
         
+        # 13. SI LLEGAMOS AQUÍ, NO HAY RESPUESTA VÁLIDA
+        if not all_received_messages:
+            raise Exception("No se recibió respuesta de ningún bot")
+                
     except Exception as e:
         return {
             "status": "error",
@@ -432,7 +403,7 @@ async def send_telegram_command(command: str, consulta_id: str = None, endpoint_
         }
         
     finally:
-        # 13. Limpieza final
+        # 14. Limpieza final
         if client:
             try:
                 # Asegurarnos de que el handler ya fue removido
@@ -723,7 +694,7 @@ def determinar_tipo_consulta_por_comando(comando_path: str):
     """Determina el tipo de consulta basado en el endpoint (solo para organización)"""
     comando = comando_path.lstrip('/').split('/')[0]
     
-    # Mapeo de comandos a tipos de consulta
+    # Mapa de comandos a tipos de consulta
     tipo_por_comando = {
         'dni': 'DNI_virtual',
         'dnif': 'DNI_virtual',
@@ -764,7 +735,7 @@ def root():
         "message": "Gateway API para LEDER DATA Bot activo (Modo Serverless).",
         "mode": "serverless",
         "cost_optimized": True,
-        "version": "4.3 - Failover corregido (1 comando por bot)"
+        "version": "4.4 - Duplicación CORREGIDA (1 comando por bot)"
     })
 
 @app.route("/status")
@@ -1247,13 +1218,12 @@ if __name__ == "__main__":
     print(f"⏰ Timeouts: Principal={TIMEOUT_PRIMARY}s, Respaldo={TIMEOUT_BACKUP}s")
     print(f"🔒 Bloqueo bot fallado: {BOT_BLOCK_HOURS} horas")
     print("✨ MEJORAS IMPLEMENTADAS:")
-    print("   ✓ ELIMINADO: Lógica de Storage PE (no funcionaba correctamente)")
-    print("   ✓ FIX: Descarga de archivos ANTES de desconectar cliente")
-    print("   ✓ FIX: Handler removido correctamente para evitar fugas")
+    print("   ✓ CORREGIDO: Problema de duplicación de comandos")
+    print("   ✓ FIX: Cada comando se envía UNA SOLA VEZ por bot")
+    print("   ✓ FIX: Handler único para evitar mensajes duplicados")
+    print("   ✓ Sistema: Envía al bot principal → Si ANTI-SPAM → Envía al bot de respaldo")
+    print("   ✓ Sistema: Si bot principal no responde → Usa solo bot de respaldo")
     print("   ✓ Captura TODOS los mensajes del bot (2, 5, 20+ mensajes)")
     print("   ✓ JSON LIMPIO sin marcas LEDERDATA")
     print("   ✓ Campos extraídos al nivel raíz (dni, nombres, apellidos, etc.)")
-    print("   ✓ FIX: Failover CORREGIDO - comando se envía UNA SOLA VEZ por bot")
-    print("   ✓ Sistema: Envía al bot principal → Si ANTI-SPAM → Envía al bot de respaldo")
-    print("   ✓ Sistema: Si bot principal no responde → Usa solo bot de respaldo")
     app.run(host="0.0.0.0", port=PORT, debug=False)
